@@ -9,6 +9,7 @@ This software is licensed as described in the file LICENSE.rst.
 from __future__ import absolute_import
 from __future__ import division, print_function, unicode_literals
 
+import codecs
 import re
 import lxml.html
 import lxml.sax
@@ -21,7 +22,7 @@ except ImportError:
 from lxml.html.clean import Cleaner
 from xml.sax.handler import ContentHandler
 from .paragraph import Paragraph
-from ._compat import unicode, ignored
+from ._compat import unicode
 from .utils import is_blank
 
 
@@ -43,6 +44,21 @@ PARAGRAPH_TAGS = frozenset({
 DEFAULT_ENCODING = 'utf8'
 DEFAULT_ENC_ERRORS = 'replace'
 CHARSET_META_TAG_PATTERN = re.compile(br"""<meta[^>]+charset=["']?([^'"/>\s]+)""", re.IGNORECASE)
+XML_ENCODING_DECLARATION_PATTERN = re.compile(
+    br"""^\s*<\?xml[^>]*?encoding\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+XML_DECLARATION_TEXT_PATTERN = re.compile(r"""^\s*<\?xml[^>]*?\?>""", re.IGNORECASE)
+# Only the beginning of the document is inspected for a <meta> charset, so
+# that a charset-looking string in the body is never mistaken for the page
+# encoding. HTML5 uses the same 1024 byte prescan window.
+HTML_ENCODING_SNIFF_BYTES = 1024
+BYTE_ORDER_MARKS = (
+    # UTF-32 must be checked before UTF-16, its BOM starts the same way
+    (codecs.BOM_UTF32_LE, 'utf-32'),
+    (codecs.BOM_UTF32_BE, 'utf-32'),
+    (codecs.BOM_UTF8, 'utf-8-sig'),
+    (codecs.BOM_UTF16_LE, 'utf-16'),
+    (codecs.BOM_UTF16_BE, 'utf-16'),
+)
 GOOD_OR_BAD = {'good', 'bad'}
 
 
@@ -54,54 +70,156 @@ class JustextInvalidOptions(JustextError):
     pass
 
 
+def _strip_bom(text):
+    """Removes a decoded byte order mark from the beginning of `text`."""
+    if text.startswith('\ufeff'):
+        return text[1:]
+    return text
+
+
+def _try_decode(html, encoding, errors):
+    """
+    Decodes `html` using `encoding` or returns `None` if the encoding is
+    unknown. Decoding errors are propagated to the caller.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return None
+    return html.decode(encoding, errors)
+
+
+def _detect_bom_encoding(html):
+    """Returns the encoding declared by a byte order mark or `None`."""
+    for bom, encoding in BYTE_ORDER_MARKS:
+        if html.startswith(bom):
+            return encoding
+    return None
+
+
+def _detect_xml_declaration_encoding(html):
+    """Returns the encoding from an XML declaration at the start or `None`."""
+    match = XML_ENCODING_DECLARATION_PATTERN.match(html)
+    if not match:
+        return None
+    try:
+        return match.group(1).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def _detect_meta_charset_encoding(html):
+    """
+    Returns the encoding from a <meta> charset declared at the beginning of
+    the document or `None`. Only the first `HTML_ENCODING_SNIFF_BYTES` bytes
+    are inspected so a charset mentioned later in the document (e.g. in the
+    body text) is never mistaken for the page encoding.
+    """
+    match = CHARSET_META_TAG_PATTERN.search(html[:HTML_ENCODING_SNIFF_BYTES])
+    if not match:
+        return None
+    try:
+        return match.group(1).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
 def html_to_dom(html, default_encoding=DEFAULT_ENCODING, encoding=None, errors=DEFAULT_ENC_ERRORS):
     """Converts HTML to DOM."""
     if isinstance(html, unicode):
-        decoded_html = html
-        # encode HTML for case it's XML with encoding declaration
-        forced_encoding = encoding if encoding else default_encoding
-        html = html.encode(forced_encoding, errors)
+        decoded_html = _strip_bom(html)
     else:
         decoded_html = decode_html(html, default_encoding, encoding, errors)
 
-    try:
-        dom = lxml.html.fromstring(decoded_html, parser=lxml.html.HTMLParser())
-    except ValueError:
-        # Unicode strings with encoding declaration are not supported.
-        # for XHTML files with encoding declaration, use the declared encoding
-        dom = lxml.html.fromstring(html, parser=lxml.html.HTMLParser())
+    # lxml refuses to parse a Unicode string carrying an encoding declaration,
+    # the text is already decoded at this point so the declaration is dropped
+    decoded_html = XML_DECLARATION_TEXT_PATTERN.sub('', decoded_html, 1)
 
-    return dom
+    return lxml.html.fromstring(decoded_html, parser=lxml.html.HTMLParser())
 
 
 def decode_html(html, default_encoding=DEFAULT_ENCODING, encoding=None, errors=DEFAULT_ENC_ERRORS):
     """
     Converts a `html` containing an HTML page into Unicode.
-    Tries to guess character encoding from meta tag.
+
+    The encoding is determined by the first of the following sources that
+    yields one, no guessing is performed:
+
+    1. the explicit `encoding` parameter,
+    2. a byte order mark,
+    3. an XML encoding declaration,
+    4. a <meta> charset declared at the beginning of the document,
+    5. UTF-8,
+    6. `default_encoding`.
+
+    Raises `JustextError` when none of the encodings can decode the document.
     """
     if isinstance(html, unicode):
-        return html
+        return _strip_bom(html)
 
-    if encoding:
-        return html.decode(encoding, errors)
-
-    match = CHARSET_META_TAG_PATTERN.search(html)
-    if match:
-        declared_encoding = match.group(1).decode("ASCII")
-        # proceed unknown encoding as if it wasn't found at all
-        with ignored(LookupError):
-            return html.decode(declared_encoding, errors)
-
-    # unknown encoding
     try:
-        # try UTF-8 first
-        return html.decode("utf8")
-    except UnicodeDecodeError:
-        # try lucky with default encoding
+        codecs.lookup_error(errors)
+    except LookupError:
+        raise JustextError("Unknown encoding error handler: %s" % errors)
+
+    # 1. explicit encoding takes precedence over everything else
+    if encoding:
         try:
-            return html.decode(default_encoding, errors)
-        except UnicodeDecodeError as e:
-            raise JustextError("Unable to decode the HTML to Unicode: " + unicode(e))
+            decoded = _try_decode(html, encoding, errors)
+        except UnicodeError as e:
+            raise JustextError(
+                "Unable to decode the HTML to Unicode using '%s': %s" % (encoding, unicode(e)))
+        if decoded is None:
+            raise JustextError("Unknown character encoding: %s" % encoding)
+        return _strip_bom(decoded)
+
+    # 2. byte order mark
+    bom_encoding = _detect_bom_encoding(html)
+    if bom_encoding:
+        try:
+            # the utf-16/utf-32 codecs consume the BOM themselves, utf-8-sig
+            # does too; the result never starts with U+FEFF
+            return _strip_bom(html.decode(bom_encoding, errors))
+        except UnicodeError as e:
+            raise JustextError(
+                "Unable to decode the HTML to Unicode using '%s': %s" % (bom_encoding, unicode(e)))
+
+    # 3. XML encoding declaration
+    declared_encoding = _detect_xml_declaration_encoding(html)
+    if declared_encoding:
+        try:
+            decoded = _try_decode(html, declared_encoding, errors)
+        except UnicodeError as e:
+            raise JustextError(
+                "Unable to decode the HTML to Unicode using declared encoding '%s': %s"
+                % (declared_encoding, unicode(e)))
+        if decoded is not None:
+            return _strip_bom(decoded)
+
+    # 4. <meta> charset at the beginning of the document
+    declared_encoding = _detect_meta_charset_encoding(html)
+    if declared_encoding:
+        try:
+            decoded = _try_decode(html, declared_encoding, errors)
+        except UnicodeError as e:
+            raise JustextError(
+                "Unable to decode the HTML to Unicode using declared encoding '%s': %s"
+                % (declared_encoding, unicode(e)))
+        if decoded is not None:
+            return _strip_bom(decoded)
+
+    # 5. UTF-8 - always strict, a successful replacement decode would hide the
+    # fact that the document isn't UTF-8 and prevent using `default_encoding`
+    try:
+        return _strip_bom(html.decode("utf-8"))
+    except UnicodeDecodeError:
+        pass
+
+    # 6. default encoding
+    try:
+        return _strip_bom(html.decode(default_encoding, errors))
+    except (LookupError, UnicodeError) as e:
+        raise JustextError("Unable to decode the HTML to Unicode: " + unicode(e))
 
 
 def preprocessor(dom):

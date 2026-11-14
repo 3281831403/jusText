@@ -18,9 +18,12 @@ def usage():
 Convert HTML to plain text and remove boilerplate.
 
   -o OUTPUT_FILE   if not specified, output is written to stdout
-  --encoding=...   default character encoding to be used if not specified
-                   in the HTML meta tags (default: %(default_encoding)s)
-  --enc-force      force specified encoding, ignore HTML meta tags
+  --encoding=...   fallback character encoding used when the document carries
+                   no explicit encoding information (BOM, XML declaration or
+                   meta charset). With --enc-force it is used for all input.
+                   (default: %(default_encoding)s)
+  --enc-force      force the encoding given by --encoding, ignore BOM, XML
+                   declarations and HTML meta tags
   --enc-errors=... errors handling for character encoding conversion:
                      strict: fail on error
                      ignore: ignore characters which can't be converted
@@ -149,7 +152,8 @@ def main():
         sys.exit(1)
 
     stream_writer = codecs.lookup('utf8')[-1]
-    fp_in = sys.stdin
+    fp_in = getattr(sys.stdin, 'buffer', sys.stdin)
+    input_is_stdin = True
     if PY3:
         fp_out = stream_writer(sys.stdout.buffer)
     else:
@@ -287,13 +291,16 @@ def main():
                 if re.match(r"[^:/]+://", args[0]):
                     fp_in = urllib.urlopen(args[0])
                 else:
-                    fp_in = open(args[0], 'r')
+                    # read raw bytes, decoding is done by justext so that
+                    # --encoding/--enc-force/--enc-errors apply to the file
+                    fp_in = open(args[0], 'rb')
+                input_is_stdin = False
             except (IOError, URLError) as e:
                 raise JustextInvalidOptions(
                     "Can't open %s for reading: %s" % (args[0], e))
 
         html_text = fp_in.read()
-        if fp_in is not sys.stdin:
+        if not input_is_stdin:
             fp_in.close()
 
         paragraphs = justext(html_text, stoplist, length_low, length_high,
